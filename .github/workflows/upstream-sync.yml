@@ -1,0 +1,150 @@
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPOSITORY: 1250237215/robinhoodwallet
+  UPSTREAM_BRANCH: main
+  DEFAULT_BRANCH: main
+  SYNC_BRANCH: bot/sync-upstream
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the downstream repository
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Fetch upstream and prepare a merge commit
+        id: merge
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "https://github.com/${UPSTREAM_REPOSITORY}.git" 2>/dev/null || \
+            git remote set-url upstream "https://github.com/${UPSTREAM_REPOSITORY}.git"
+          git fetch --no-tags upstream "${UPSTREAM_BRANCH}"
+
+          upstream_sha="$(git rev-parse "upstream/${UPSTREAM_BRANCH}")"
+          echo "upstream_sha=${upstream_sha}" >> "${GITHUB_OUTPUT}"
+
+          if git merge-base --is-ancestor "${upstream_sha}" "origin/${DEFAULT_BRANCH}"; then
+            echo "status=up_to_date" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          git switch --force-create "${SYNC_BRANCH}" "origin/${DEFAULT_BRANCH}"
+
+          set +e
+          git merge --no-edit --no-ff "upstream/${UPSTREAM_BRANCH}"
+          merge_status=$?
+          set -e
+
+          if [[ ${merge_status} -ne 0 ]]; then
+            git merge --abort || true
+            echo "status=conflict" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          echo "status=merged" >> "${GITHUB_OUTPUT}"
+
+      - name: Report an upstream merge conflict
+        if: steps.merge.outputs.status == 'conflict'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_SHA: ${{ steps.merge.outputs.upstream_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          title="Automated upstream sync conflict"
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          body="The scheduled merge from \`${UPSTREAM_REPOSITORY}:${UPSTREAM_BRANCH}\` into \`${DEFAULT_BRANCH}\` has conflicts.\n\nUpstream commit: \`${UPSTREAM_SHA}\`\nWorkflow run: ${run_url}\n\nResolve this manually in a dedicated pull request; do not force-push or replace downstream history."
+          issue_number="$(gh issue list --repo "${GITHUB_REPOSITORY}" --state open --search "${title} in:title" --json number --jq '.[0].number // empty')"
+
+          if [[ -n "${issue_number}" ]]; then
+            gh issue comment "${issue_number}" --repo "${GITHUB_REPOSITORY}" --body "${body}"
+          else
+            gh issue create --repo "${GITHUB_REPOSITORY}" --title "${title}" --body "${body}"
+          fi
+
+          exit 1
+
+      - name: Push the synchronization branch
+        if: steps.merge.outputs.status == 'merged'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git push --force origin "${SYNC_BRANCH}"
+
+      - name: Open or refresh the synchronization pull request
+        if: steps.merge.outputs.status == 'merged'
+        id: pull_request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_SHA: ${{ steps.merge.outputs.upstream_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          title="chore: sync upstream ${UPSTREAM_REPOSITORY}"
+          body="Automated merge of \`${UPSTREAM_REPOSITORY}:${UPSTREAM_BRANCH}\` at \`${UPSTREAM_SHA}\`.\n\nReview downstream integration points, schema changes, dependencies, routes, and files under downstream-owned Wind directories before merging."
+          pr_number="$(gh pr list --repo "${GITHUB_REPOSITORY}" --head "${SYNC_BRANCH}" --base "${DEFAULT_BRANCH}" --state open --json number --jq '.[0].number // empty')"
+
+          if [[ -z "${pr_number}" ]]; then
+            pr_url="$(gh pr create --repo "${GITHUB_REPOSITORY}" --base "${DEFAULT_BRANCH}" --head "${SYNC_BRANCH}" --title "${title}" --body "${body}")"
+            pr_number="${pr_url##*/}"
+          else
+            gh pr edit "${pr_number}" --repo "${GITHUB_REPOSITORY}" --title "${title}" --body "${body}"
+          fi
+
+          echo "pr_number=${pr_number}" >> "${GITHUB_OUTPUT}"
+
+      - name: Request GitHub Copilot review
+        if: steps.merge.outputs.status == 'merged'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.pull_request.outputs.pr_number }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          gh api \
+            --method POST \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "/repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/requested_reviewers" \
+            --raw-field 'reviewers[]=copilot-pull-request-reviewer[bot]' || \
+            echo "::warning::The upstream PR was created, but Copilot review could not be requested."
+
+      - name: Close a resolved conflict issue
+        if: steps.merge.outputs.status == 'merged'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          title="Automated upstream sync conflict"
+          issue_number="$(gh issue list --repo "${GITHUB_REPOSITORY}" --state open --search "${title} in:title" --json number --jq '.[0].number // empty')"
+
+          if [[ -n "${issue_number}" ]]; then
+            gh issue close "${issue_number}" --repo "${GITHUB_REPOSITORY}" --comment "The automated upstream merge succeeded in a later run."
+          fi
