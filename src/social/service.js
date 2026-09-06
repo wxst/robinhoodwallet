@@ -515,7 +515,9 @@ export function createSocialService({
           sourceText,
           translatedContent
         ),
-        onFailed: priority === 'realtime' ? scheduleTranslationRecovery : null,
+        // Reopen the backfill after any terminal provider failure. This keeps
+        // failed historical rows retryable without delaying the live queue.
+        onFailed: scheduleTranslationRecovery,
         onDropped: priority === 'background'
           ? () => {
               translationBackfill.complete = false;
@@ -558,8 +560,10 @@ export function createSocialService({
       scheduleTranslationBackfill(250);
       return;
     }
+    const postCount = Number(activeStore.getCounts?.().posts || 0);
+    const pageLimit = postCount > 1_000 ? activeLimit * 2 : 100;
     const page = typeof activeStore.listPostsForTranslation === 'function'
-      ? activeStore.listPostsForTranslation({ beforeId: translationBackfillCursor, limit: 100 })
+      ? activeStore.listPostsForTranslation({ beforeId: translationBackfillCursor, limit: pageLimit })
       : [];
     if (!page.length) {
       translationBackfill.complete = true;
