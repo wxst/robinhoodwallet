@@ -3,6 +3,8 @@ import { mkdir, readdir, stat } from 'node:fs/promises';
 import { basename, resolve, sep } from 'node:path';
 import { promisify } from 'node:util';
 
+import { GROUP_OWNERS_ID } from './config.js';
+
 const execFileAsync = promisify(execFile);
 
 export class LarkCliError extends Error {
@@ -22,18 +24,53 @@ function contentText(value) {
   return contentText(value.text || value.content || value.content_v2 || '');
 }
 
+export function normalizeSenderAvatarUrl(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  let url;
+  try {
+    url = new URL(raw);
+  } catch {
+    return '';
+  }
+  if (url.protocol !== 'https:') return '';
+  const hostname = url.hostname.toLowerCase();
+  const allowed = hostname === 'feishu.cn'
+    || hostname.endsWith('.feishu.cn')
+    || hostname === 'larksuite.com'
+    || hostname.endsWith('.larksuite.com')
+    || hostname.endsWith('.feishucdn.com')
+    || hostname.endsWith('.larksuitecdn.com');
+  return allowed ? url.href : '';
+}
+
+function senderAvatarUrl(sender) {
+  const candidates = [
+    sender?.avatar_url,
+    sender?.avatarUrl,
+    sender?.sender_avatar_url,
+    sender?.senderAvatarUrl,
+    sender?.avatar?.avatar_origin,
+    sender?.avatar?.origin,
+    sender?.avatar?.url
+  ];
+  return candidates.map(normalizeSenderAvatarUrl).find(Boolean) || '';
+}
+
 export function normalizeRawMessage(message) {
   let body = message.body?.content ?? message.content ?? '';
   if (typeof body === 'string') {
     try { body = JSON.parse(body); } catch { /* keep plain text */ }
   }
   const content = contentText(body);
+  const avatarUrl = senderAvatarUrl(message.sender);
   const timestamp = Number(message.create_time);
   const createdAt = Number.isFinite(timestamp) && timestamp > 0
     ? new Date(timestamp).toISOString()
     : String(message.create_time || '');
   return {
     ...message,
+    ...(avatarUrl ? { sender: { ...message.sender, avatar_url: avatarUrl } } : {}),
     content,
     create_time: createdAt,
     message_app_link: message.message_app_link || (message.chat_id && message.message_position
@@ -45,6 +82,68 @@ export function normalizeRawMessage(message) {
 export function createLarkClient(options = {}) {
   const command = options.command || process.env.LARK_CLI || 'lark-cli';
   const timeout = Number(options.timeout || 30_000);
+  const execFileImpl = options.execFileImpl || execFileAsync;
+  const senderDetailsCache = new Map();
+
+  function rememberSenderDetails(messages) {
+    for (const message of messages) {
+      const id = String(message?.message_id || '');
+      if (!/^om_[A-Za-z0-9_-]+$/.test(id)) continue;
+      if (message?.sender && typeof message.sender === 'object') {
+        senderDetailsCache.set(id, message.sender);
+      }
+    }
+    while (senderDetailsCache.size > 20_000) {
+      senderDetailsCache.delete(senderDetailsCache.keys().next().value);
+    }
+  }
+
+  async function enrichSenderNames(chatId, messages) {
+    if (String(chatId) !== GROUP_OWNERS_ID || !messages.length) return messages;
+    const missing = messages
+      .map((message) => String(message?.message_id || ''))
+      .filter((id) => /^om_[A-Za-z0-9_-]+$/.test(id) && !senderDetailsCache.has(id));
+    if (!missing.length) {
+      return messages.map((message) => ({
+        ...message,
+        sender: {
+          ...(message.sender || {}),
+          ...(senderDetailsCache.get(String(message.message_id)) || {})
+        }
+      }));
+    }
+    let stdout;
+    try {
+      ({ stdout } = await execFileImpl(command, [
+        'api', 'GET', '/open-apis/im/v1/messages/mget',
+        '--as', 'user',
+        '--params', JSON.stringify({
+          card_msg_content_type: 'raw_card_content',
+          with_sender_name: true,
+          message_ids: missing
+        }),
+        '--format', 'json'
+      ], {
+        timeout,
+        maxBuffer: 12 * 1024 * 1024,
+        encoding: 'utf8'
+      }));
+      const payload = JSON.parse(stdout);
+      if (!payload.ok) throw new Error(payload.error?.message || 'lark-cli message enrichment failed');
+      const details = Array.isArray(payload.data?.items) ? payload.data.items : [];
+      rememberSenderDetails(details);
+    } catch {
+      // Sender enrichment is optional; keep the live message list available
+      // if a detail lookup is temporarily unavailable.
+    }
+    return messages.map((message) => ({
+      ...message,
+      sender: {
+        ...(message.sender || {}),
+        ...(senderDetailsCache.get(String(message.message_id)) || {})
+      }
+    }));
+  }
 
   async function fetchChatPage(chatId, { pageSize = 50, pageToken = '' } = {}) {
     const params = {
@@ -63,7 +162,7 @@ export function createLarkClient(options = {}) {
 
     let stdout;
     try {
-      ({ stdout } = await execFileAsync(command, args, {
+      ({ stdout } = await execFileImpl(command, args, {
         timeout,
         maxBuffer: 12 * 1024 * 1024,
         encoding: 'utf8'
@@ -89,8 +188,10 @@ export function createLarkClient(options = {}) {
       });
     }
 
+    const rawMessages = Array.isArray(payload.data?.items) ? payload.data.items : [];
+    const enrichedMessages = await enrichSenderNames(chatId, rawMessages);
     return {
-      messages: (Array.isArray(payload.data?.items) ? payload.data.items : []).map(normalizeRawMessage),
+      messages: enrichedMessages.map(normalizeRawMessage),
       hasMore: Boolean(payload.data?.has_more),
       pageToken: payload.data?.page_token || ''
     };
@@ -111,7 +212,7 @@ export function createLarkClient(options = {}) {
     }
     let stdout;
     try {
-      ({ stdout } = await execFileAsync(command, [
+      ({ stdout } = await execFileImpl(command, [
         'im', '+messages-resources-download',
         '--as', 'user',
         '--message-id', messageId,
