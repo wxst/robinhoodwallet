@@ -2,7 +2,7 @@ const CRAZYSEN_GROUP_ID = 'oc_884bb58e6b0b07d56c610364cab40a03';
 const SEN_CHANNEL_ID = 'oc_a1ff43aca201bc05ee024e0238345d02';
 const LASERCAT_GROUP_ID = 'oc_f624316b25a32ab66af618989b2c2aec';
 const JINWA_GROUP_ID = 'oc_215ff685ff278ad855288a3d640d7b32';
-const GROUP_OWNERS_ID = 'oc_e14c9de830ac46862a0dd1ca764819c3';
+export const GROUP_OWNERS_ID = 'oc_e14c9de830ac46862a0dd1ca764819c3';
 
 function prefixMatcher(prefix) {
   return {
@@ -48,6 +48,15 @@ const cryptoD = quotedSpeakerMatcher('CryptoD');
 const wangXiaoer = quotedSpeakerMatcher('王小二');
 const zeroXSun = quotedSpeakerMatcher('孙嘉良0xSun');
 const zeroXAce = prefixMatcher('【0xace（尊师陈皮皮）');
+const groupOwnersBots = {
+  matches(message) {
+    const sender = message?.sender || {};
+    return sender.sender_type === 'app';
+  },
+  clean(content) {
+    return String(content || '');
+  }
+};
 const chenpepe = {
   matches(message) {
     const content = String(message.content || '').trim();
@@ -178,6 +187,16 @@ export const PEOPLE = Object.freeze([
     accent: 'green',
     matches: zeroXSun.matches,
     clean: zeroXSun.clean
+  },
+  {
+    id: 'group_owners_bots',
+    name: '一级群全部机器人',
+    shortName: '机',
+    source: '各大群主发言（一级）',
+    chatId: GROUP_OWNERS_ID,
+    accent: 'violet',
+    matches: groupOwnersBots.matches,
+    clean: groupOwnersBots.clean
   },
   {
     id: '0xace',
